@@ -1,0 +1,16 @@
+{
+  "name": "pkzip-parser",
+  "version": "0.0.0",
+  "description": "Parses PKZIP formatted files.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": "",
+  "author": "",
+  "license": "BSD",
+  "dependencies": {
+    "mkee": "0.0.0",
+    "mkstream": "0.0.0"
+  }
+}
