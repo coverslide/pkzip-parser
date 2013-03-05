@@ -26,6 +26,7 @@ function PkzipParser(stream, readExtra){
   this.cache = []
   this.cursor = 0
   this.cacheCursor = 0
+  this.offset = 0
   this.status = {}
   this.statusId = READY
   this.readExtra = readExtra // by default, only read what's necessary to stream data
@@ -59,12 +60,12 @@ PkzipParser.prototype.nextStep = function(){
           this.nextStep()
         } else if(signature == CENTRAL_DIRECTORY_SIGNATURE){
           if(!this.readExtra) // all file headers are finished
-            return this.removeAllListeners('data')
+            return this.statusId = SKIP, this.removeAllListeners('data')
           this.statusId = CENTRAL_DIRECTORY
           this.nextStep()
         } else if(signature == CD_END_SIGNATURE){
           if(!this.readExtra) // all file headers are finished
-            return this.removeAllListeners('data')
+            return this.statusId = SKIP,this.removeAllListeners('data')
           this.statusId = CD_END
           this.nextStep()
         } else {
@@ -134,6 +135,7 @@ PkzipParser.prototype.nextStep = function(){
           if(remaining > bufferRemain){
             var dataSlice = currentBuffer.slice(this.cursor)
             this.cacheCursor += 1
+            this.offset += bufferRemain 
             this.cursor = 0
             this.status.read += bufferRemain
             this.status.stream.emit('data', dataSlice)
@@ -142,6 +144,7 @@ PkzipParser.prototype.nextStep = function(){
             if(remaining > 0){
               var dataSlice = currentBuffer.slice(this.cursor, this.cursor + remaining)
               this.cursor += remaining
+              this.offset += remaining
               this.status.read += remaining
               this.status.stream.emit('data', dataSlice)
             }
@@ -244,6 +247,7 @@ PkzipParser.prototype.nextStep = function(){
   }
 }
 
+//not really using the parse all that much
 function parseDOSTime(rawTime){
   var seconds = rawTime & 0x1f
   var minutes = (rawTime >> 5) & 0x3f
@@ -324,8 +328,10 @@ PkzipParser.prototype.read = function(count, endOk){
     var readEnd = this.cursor + count
     if(readEnd <= currentBuffer[this.lp]){
       this.cursor += count
-      return currentBuffer.slice(oldCursor, this.cursor)
-    } else {
+      this.offset += count
+      var data = currentBuffer.slice(oldCursor, this.cursor)
+      return data
+    } else if(this.cache[this.cacheCursor + 1]) {
       var oldCacheCursor = this.cacheCursor
       var oldBuffer = currentBuffer.slice(this.cursor)
 
@@ -335,14 +341,16 @@ PkzipParser.prototype.read = function(count, endOk){
       //let's hope this recurses safely
       var nextBuffer = this.read(count - oldBuffer[this.lp], endOk)
       if(nextBuffer){
-        return combineBuffers(oldBuffer, nextBuffer)
+        this.offset += nextBuffer[this.lp]
+        var data = combineBuffers(oldBuffer, nextBuffer)
+        return data
       } else {
         this.cursor = oldCursor
         this.cacheCursor = oldCacheCursor
       }
     }
   }
-  if(this.ended && endOk)
+  if(this.ended && !endOk)
     this.emit('error', "read could not be performed on ended stream")
 }
 
