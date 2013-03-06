@@ -1,7 +1,9 @@
 'use strict'
 
-require('mkee')(PkzipParser)
+require('mkstream')(PkzipParser)
 require('mkstream')(PkzipDataStream)
+
+var Buffer = require('buffer').Buffer
 
 module.exports = PkzipParser
 
@@ -22,77 +24,82 @@ var S             = 0
 , CENTRAL_DIRECTORY_SIGNATURE = 0x02014B50
 , CD_END_SIGNATURE            = 0x06054B50
 
-function PkzipParser(stream, readExtra){
+function PkzipParser(readExtra){
+  this.writable = true
   this.cache = []
   this.cursor = 0
-  this.cacheCursor = 0
   this.offset = 0
+  this.cacheCursor = 0
   this.status = {}
   this.statusId = READY
   this.readExtra = readExtra // by default, only read what's necessary to stream data
-  this.lp // length parameter
-  
-  var _this = this
-  stream.on('data', function(data){
-    if(!_this.lp){
-      _this.lp = 'byteLength' in  data ? 'byteLength' : 'length'
-    }
-    _this.cache.push(data)
-    _this.nextStep()
-  })
+}
 
-  stream.on('end', function(){
-    _this.ended = true
-    _this.emit('end')
-  })
+PkzipParser.prototype.write = function(data){
+  this.cache.push(data)
+  this.nextStep()
+}
+
+PkzipParser.prototype.end = function(data){
+  if(data)
+    this.cache.push(data)
+  this.ended = true
+  this.nextStep()
 }
 
 PkzipParser.prototype.nextStep = function(){
   switch(this.statusId){
     case READY:
-      var signatureHeader = this.read(4, false)
+      var signatureHeader = this.read(4, true)
 
       if(signatureHeader){
-        var dataView = new DataView(signatureHeader)
-        var signature = dataView.getUint32(0, true)
+        this.offset += 4
+        var signature = signatureHeader.readUInt32LE(0, true)
         if(signature == FILE_HEADER_SIGNATURE){
           this.statusId = FILE_HEAD
           this.nextStep()
         } else if(signature == CENTRAL_DIRECTORY_SIGNATURE){
           if(!this.readExtra) // all file headers are finished
-            return this.statusId = SKIP, this.removeAllListeners('data')
+            return this.statusId = SKIP,this.emit('end')
           this.statusId = CENTRAL_DIRECTORY
           this.nextStep()
         } else if(signature == CD_END_SIGNATURE){
           if(!this.readExtra) // all file headers are finished
-            return this.statusId = SKIP,this.removeAllListeners('data')
+            return this.statusId = SKIP, this.emit('end')
           this.statusId = CD_END
           this.nextStep()
         } else {
           this.emit('error', new Error('Unknown signature encountered: '  + signature.toString(16)))
           this.statusId = SKIP
         }
+      } else if(this.ended){
+        this.emit('end')
       }
       break
     case FILE_HEAD:
       var headerData = this.read(26)
 
       if(headerData){
-        var dataView = new DataView(headerData)
+        this.offset += 26
         var header = {
-          version: dataView.getUint16(0, true)
-          , bitFlags: dataView.getUint16(2,true)
-          , compressionType: dataView.getUint16(4,true)
-          , lastModTimeRaw: dataView.getUint16(6, true)
-          , lastModDateRaw: dataView.getUint16(8, true)
-          , crc32: dataView.getUint32(10, true)
-          , compressedSize: dataView.getUint32(14, true)
-          , uncompressedSize: dataView.getUint32(18, true)
-          , fileNameLength: dataView.getUint16(22, true)
-          , extraFieldLength: dataView.getUint16(24, true)
+          version: headerData.readUInt16LE(0, true)
+          , bitFlags: headerData.readUInt16LE(2,true)
+          , compressionType: headerData.readUInt16LE(4,true)
+          , lastModTimeRaw: headerData.readUInt16LE(6, true)
+          , lastModDateRaw: headerData.readUInt16LE(8, true)
+          , crc32: headerData.readUInt32LE(10, true)
+          , compressedSize: headerData.readUInt32LE(14, true)
+          , uncompressedSize: headerData.readUInt32LE(18, true)
+          , fileNameLength: headerData.readUInt16LE(22, true)
+          , extraFieldLength: headerData.readUInt16LE(24, true)
         }
+
+        var headerSize = 30 + header.fileNameLength + header.extraFieldLength 
+        header.headerSize = headerSize
+        header.length = header.compressedSize + headerSize
+        header.offset = this.offset - 30
         header.dataDescriptor = !!(header.bitFlags & 0x8)
-        //parse data / time fields
+        //parse date / time fields
         if(this.readExtra){
           header.lastModTime = parseDOSTime(header.lastModTimeRaw)
           header.lastModDate = parseDOSDate(header.lastModDateRaw)
@@ -110,13 +117,11 @@ PkzipParser.prototype.nextStep = function(){
       var extraData = this.read(extraDataLength)
 
       if(extraData){
+        this.offset += extraDataLength
         var fileNameData = extraData.slice(0, header.fileNameLength)
-        header.fileName = String.fromCharCode.apply(null, new Uint8Array(fileNameData))
+        header.fileName = fileNameData.toString() 
         if(this.readExtra){
           header.extraFieldData = extraData.slice(header.fileNameLength)
-          if(header.extraFieldData[this.lp] > 0){
-            header.extraField = parseExtraFieldData(header.extraFieldData)
-          }
         }
         this.statusId = FILE_DATA
         this.status.read = 0
@@ -131,20 +136,20 @@ PkzipParser.prototype.nextStep = function(){
         if(!this.status.dataDescriptor){
           var total = this.status.compressedSize
           var remaining = total - this.status.read
-          var bufferRemain = currentBuffer[this.lp] - this.cursor
+          var bufferRemain = currentBuffer.length - this.cursor
           if(remaining > bufferRemain){
             var dataSlice = currentBuffer.slice(this.cursor)
             this.cacheCursor += 1
-            this.offset += bufferRemain 
             this.cursor = 0
+            this.offset += bufferRemain
             this.status.read += bufferRemain
             this.status.stream.emit('data', dataSlice)
             this.nextStep()
           } else {
             if(remaining > 0){
               var dataSlice = currentBuffer.slice(this.cursor, this.cursor + remaining)
-              this.cursor += remaining
               this.offset += remaining
+              this.cursor += remaining
               this.status.read += remaining
               this.status.stream.emit('data', dataSlice)
             }
@@ -165,24 +170,24 @@ PkzipParser.prototype.nextStep = function(){
       var headerData = this.read(42)
 
       if(headerData){
-        var dataView = new DataView(headerData)
+        this.offset += 42
         var header = {
-          version: dataView.getUint16(0, true)
-          , minVersion: dataView.getUint16(2, true)
-          , bitFlags: dataView.getUint16(4,true)
-          , compressionType: dataView.getUint16(6,true)
-          , lastModTimeRaw: dataView.getUint16(8, true)
-          , lastModDateRaw: dataView.getUint16(10, true)
-          , crc32: dataView.getUint32(12, true)
-          , compressedSize: dataView.getUint32(16, true)
-          , uncompressedSize: dataView.getUint32(20, true)
-          , fileNameLength: dataView.getUint16(24, true)
-          , extraFieldLength: dataView.getUint16(26, true)
-          , fileCommentLength: dataView.getUint16(28, true)
-          , diskNumber: dataView.getUint16(30, true)
-          , internalAttributes: dataView.getUint16(32, true)
-          , externalAttributes: dataView.getUint32(34, true)
-          , offset: dataView.getUint32(38, true)
+          version: headerData.readUInt16LE(0, true)
+          , minVersion: headerData.readUInt16LE(2, true)
+          , bitFlags: headerData.readUInt16LE(4,true)
+          , compressionType: headerData.readUInt16LE(6,true)
+          , lastModTimeRaw: headerData.readUInt16LE(8, true)
+          , lastModDateRaw: headerData.readUInt16LE(10, true)
+          , crc32: headerData.readUInt32LE(12, true)
+          , compressedSize: headerData.readUInt32LE(16, true)
+          , uncompressedSize: headerData.readUInt32LE(20, true)
+          , fileNameLength: headerData.readUInt16LE(24, true)
+          , extraFieldLength: headerData.readUInt16LE(26, true)
+          , fileCommentLength: headerData.readUInt16LE(28, true)
+          , diskNumber: headerData.readUInt16LE(30, true)
+          , internalAttributes: headerData.readUInt16LE(32, true)
+          , externalAttributes: headerData.readUInt32LE(34, true)
+          , offset: headerData.readUInt32LE(38, true)
         }
         header.dataDescriptor = !!(header.bitFlags & 0x8)
         //parse data / time fields
@@ -203,15 +208,12 @@ PkzipParser.prototype.nextStep = function(){
       var extraData = this.read(extraDataLength)
 
       if(extraData){
+        this.offset += extraDataLength
         var fileNameData = extraData.slice(0, header.fileNameLength)
-        header.fileName = String.fromCharCode.apply(null, new Uint8Array(fileNameData))
+        header.fileName = String.fromCharCode.apply(null, new UInt8Array(fileNameData))
         header.extraFieldData = extraData.slice(header.fileNameLength, header.fileNameLength + header.extraFieldLength)
         var fileCommentData = extraData.slice(header.fileNameLength + header.extraFieldLength)
-        header.fileComment = String.fromCharCode.apply(null, new Uint8Array(fileCommentData))
-        if(header.extraFieldData[this.lp] > 0){
-          //doesn't seem to work 100% in the CD
-          //header.extraField = parseExtraFieldData(header.extraFieldData)
-        }
+        header.fileComment = String.fromCharCode.apply(null, new UInt8Array(fileCommentData))
         this.emit('cd', this.status)
         this.statusId = READY
         this.nextStep()
@@ -221,15 +223,15 @@ PkzipParser.prototype.nextStep = function(){
       var headerData = this.read(18)
 
       if(headerData){
-        var dataView = new DataView(headerData)
+        this.offset += 18
         var header = {
-          diskNumber: dataView.getUint16(0, true)
-          , diskCDStartNumber: dataView.getUint16(2, true)
-          , CDDiskCount: dataView.getUint16(4, true)
-          , CDTotalCount: dataView.getUint16(6, true)
-          , CDTotalSize: dataView.getUint32(8, true)
-          , CDOffset: dataView.getUint32(12, true)
-          , commentLength: dataView.getUint16(16, true)
+          diskNumber: headerData.readUInt16LE(0, true)
+          , diskCDStartNumber: headerData.readUInt16LE(2, true)
+          , CDDiskCount: headerData.readUInt16LE(4, true)
+          , CDTotalCount: headerData.readUInt16LE(6, true)
+          , CDTotalSize: headerData.readUInt32LE(8, true)
+          , CDOffset: headerData.readUInt32LE(12, true)
+          , commentLength: headerData.readUInt16LE(16, true)
         }
         this.status = header
         this.statusId = header.commentLength ? CD_END_EXTRA : READY 
@@ -239,10 +241,14 @@ PkzipParser.prototype.nextStep = function(){
     case CD_END_EXTRA:
       if(!this.commentLength){
         var commentData = this.read(this.commentLength)
-        this.status.comment = String.fromCharCode.apply(null, new Uint8Array(commentData))
+        if(!commentData)
+          return
+        this.offset += this.commentLength
+        this.status.comment = String.fromCharCode.apply(null, new UInt8Array(commentData))
       }
       this.statusId = READY
       this.emit('cdEnd', this.status)
+      this.emit('end')
       break
   }
 }
@@ -262,73 +268,14 @@ function parseDOSDate(rawDate){
   return year + '-' + month + '-' + day
 }
 
-function parseExtraFieldData(extraFieldData){
-  var dataView = new DataView(extraFieldData)
-  var offset = 0
-  var length = dataView.byteLength
-  var extraField = []
-  while(offset < length){
-    var id = dataView.getUint16(offset, true)
-    var fieldLength = dataView.getUint16(offset + 2, true)
-    offset += 4
-    if(fieldLength > 0){
-      var fieldData = extraFieldData.slice(offset, offset + fieldLength)
-      offset += fieldLength
-      var parsedFieldData = parseExtraField(id, fieldData)
-    }
-    extraField.push({id:id.toString(16), data: parsedFieldData || fieldData})
-  }
-  return extraField
-}
-
-//the ones that commonly seem to be generated on linux
-var EF_EXTENDED_TIMESTAMP = 0x5455
-var EF_EXTRA_FIELD_V3 = 0x7875
-
-function parseExtraField(id, fieldData){
-  var dataView = new DataView(fieldData)
-  switch(id){
-    case EF_EXTENDED_TIMESTAMP:
-      var flags = dataView.getUint8(0)
-      var data = {}
-      var offset = 1
-      if(flags & 1){
-        data.mtime = dataView.getUint32(offset,true)
-        offset += 4
-      }
-      if(flags & 2){
-        data.atime = dataView.getUint32(offset,true)
-        offset += 4
-      }
-      if(flags & 4){
-        data.ctime = dataView.getUint32(offset,true)
-        offset += 4
-      }
-      return data
-      break
-    case EF_EXTRA_FIELD_V3:
-      var data = {}
-      var offset = 1
-      data.version = dataView.getUint8(0)
-      var uidSize = dataView.getUint8(1)
-      data.uid = dataView[uidSize == 4 ? 'getUint32' : uidSize == 2 ? 'getUint16' : 'getUint8'](offset, true)
-      offset += uidSize
-      var gidSize = dataView.getUint8(1)
-      data.gid = dataView[gidSize == 4 ? 'getUint32' : gidSize == 2 ? 'getUint16' : 'getUint8'](offset, true)
-      return data
-      break
-  }
-}
-
 // TODO: good thing to separate into a module 
 PkzipParser.prototype.read = function(count, endOk){
   var oldCursor = this.cursor
   var currentBuffer = this.cache[this.cacheCursor]
   if(currentBuffer){
     var readEnd = this.cursor + count
-    if(readEnd <= currentBuffer[this.lp]){
+    if(readEnd <= currentBuffer.length){
       this.cursor += count
-      this.offset += count
       var data = currentBuffer.slice(oldCursor, this.cursor)
       return data
     } else if(this.cache[this.cacheCursor + 1]) {
@@ -339,9 +286,8 @@ PkzipParser.prototype.read = function(count, endOk){
       this.cacheCursor += 1
 
       //let's hope this recurses safely
-      var nextBuffer = this.read(count - oldBuffer[this.lp], endOk)
+      var nextBuffer = this.read(count - oldBuffer.length, endOk)
       if(nextBuffer){
-        this.offset += nextBuffer[this.lp]
         var data = combineBuffers(oldBuffer, nextBuffer)
         return data
       } else {
@@ -355,14 +301,7 @@ PkzipParser.prototype.read = function(count, endOk){
 }
 
 function combineBuffers(buf1, buf2){
-  if(typeof Buffer != 'undefined' && Buffer.isBuffer(buf1) && Buffer.isBuffer(buf2))
-    return Buffer.concat([buf1, buf2], buf1.length + buf2.length)
-  else {
-    var tmp = new Uint8Array(buf1.length + buf2.length)
-    tmp.set(0, new Uint8Array(buf1))
-    tmp.set(buf1.byteLength, new Uint8Array(buf2))
-    return tmp.buffer
-  }
+  return Buffer.concat([buf1, buf2], buf1.length + buf2.length)
 }
 
 function PkzipDataStream(){
