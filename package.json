@@ -1,6 +1,6 @@
 {
   "name": "pkzip-parser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Parses PKZIP formatted files.",
   "main": "index.js",
   "scripts": {
@@ -11,5 +11,6 @@
   "license": "BSD",
   "dependencies": {
     "mkstream": "0.0.0"
+    , "mkreader": "0.0.0"
   }
 }

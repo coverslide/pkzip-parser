@@ -1,6 +1,6 @@
 'use strict'
 
-require('mkstream')(PkzipParser)
+require('mkreader')(PkzipParser)
 require('mkstream')(PkzipDataStream)
 
 var Buffer = require('buffer').Buffer
@@ -8,7 +8,7 @@ var Buffer = require('buffer').Buffer
 module.exports = PkzipParser
 
 var S             = 0
-, READY             = ++S //ready to read the next 4 bytes for header
+, READY             = ++S //ready to read the next 4 bytes for header signature
 , FILE_HEAD         = ++S //ready to read a file header -- 22 bytes
 , FILE_HEADER_EXTRA = ++S //extra data + file name fields
 , FILE_DATA         = ++S
@@ -24,30 +24,49 @@ var S             = 0
 , CENTRAL_DIRECTORY_SIGNATURE = 0x02014B50
 , CD_END_SIGNATURE            = 0x06054B50
 
+, COMPRESSION_UNCOMPRESSED      = 0x0
+, COMPRESSION_SHRINK            = 0x1
+, COMPRESSION_REDUCE_1          = 0x2
+, COMPRESSION_REDUCE_2          = 0x3
+, COMPRESSION_REDUCE_3          = 0x4
+, COMPRESSION_REDUCE_4          = 0x5
+, COMPRESSION_IMPLODE           = 0x6
+, COMPRESSION_DEFLATE           = 0x8
+, COMPRESSION_DEFLATE_ENHANCED  = 0x9
+, COMPRESSION_BZIP2             = 0xC
+, COMPRESSION_LZMA              = 0xD
+
+, COMPRESSION_TYPES = {}
+, C = COMPRESSION_TYPES
+
+C[COMPRESSION_UNCOMPRESSED] = "uncompressed"
+C[COMPRESSION_SHRINK] = "shrink"
+C[COMPRESSION_REDUCE_1] = "reduce-1"
+C[COMPRESSION_REDUCE_2] = "reduce-2"
+C[COMPRESSION_REDUCE_3] = "reduce-3"
+C[COMPRESSION_REDUCE_4] = "reduce-4"
+C[COMPRESSION_IMPLODE] = "implode"
+C[COMPRESSION_DEFLATE] = "deflate"
+C[COMPRESSION_DEFLATE_ENHANCED] = "deflate-enhanced"
+C[COMPRESSION_BZIP2] = "bzip2"
+C[COMPRESSION_LZMA] = "lzma"
+
 function PkzipParser(readExtra){
-  this.writable = true
-  this.cache = []
-  this.cursor = 0
+  this.initReader()
   this.offset = 0
-  this.cacheCursor = 0
   this.status = {}
   this.statusId = READY
   this.readExtra = readExtra // by default, only read what's necessary to stream data
 }
 
-PkzipParser.prototype.write = function(data){
-  this.cache.push(data)
-  this.nextStep()
-}
-
 PkzipParser.prototype.end = function(data){
   if(data)
     this.cache.push(data)
-  this.ended = true
-  this.nextStep()
+  this._reader.ended = true
+  this.readNext()
 }
 
-PkzipParser.prototype.nextStep = function(){
+PkzipParser.prototype.readNext = function(){
   switch(this.statusId){
     case READY:
       var signatureHeader = this.read(4, true)
@@ -57,17 +76,17 @@ PkzipParser.prototype.nextStep = function(){
         var signature = signatureHeader.readUInt32LE(0, true)
         if(signature == FILE_HEADER_SIGNATURE){
           this.statusId = FILE_HEAD
-          this.nextStep()
+          this.readNext()
         } else if(signature == CENTRAL_DIRECTORY_SIGNATURE){
           if(!this.readExtra) // all file headers are finished
             return this.statusId = SKIP,this.emit('end')
           this.statusId = CENTRAL_DIRECTORY
-          this.nextStep()
+          this.readNext()
         } else if(signature == CD_END_SIGNATURE){
           if(!this.readExtra) // all file headers are finished
             return this.statusId = SKIP, this.emit('end')
           this.statusId = CD_END
-          this.nextStep()
+          this.readNext()
         } else {
           this.emit('error', new Error('Unknown signature encountered: '  + signature.toString(16)))
           this.statusId = SKIP
@@ -84,7 +103,7 @@ PkzipParser.prototype.nextStep = function(){
         var header = {
           version: headerData.readUInt16LE(0, true)
           , bitFlags: headerData.readUInt16LE(2,true)
-          , compressionType: headerData.readUInt16LE(4,true)
+          , compressionTypeId: headerData.readUInt16LE(4,true)
           , lastModTimeRaw: headerData.readUInt16LE(6, true)
           , lastModDateRaw: headerData.readUInt16LE(8, true)
           , crc32: headerData.readUInt32LE(10, true)
@@ -94,23 +113,28 @@ PkzipParser.prototype.nextStep = function(){
           , extraFieldLength: headerData.readUInt16LE(24, true)
         }
 
-        var headerSize = 30 + header.fileNameLength + header.extraFieldLength 
-        header.headerSize = headerSize
-        header.length = header.compressedSize + headerSize
-        header.offset = this.offset - 30
         header.dataDescriptor = !!(header.bitFlags & 0x8)
+        header.compressionType = COMPRESSION_TYPES[header.compressionTypeId] || 'unknown'
+
+        //positional data
+        var headerSize = 30 + header.fileNameLength + header.extraFieldLength 
+        var position = {
+          headerSize: headerSize
+          , length: header.compressedSize + headerSize
+          , offset: this.offset - 30
+        }
         //parse date / time fields
         if(this.readExtra){
           header.lastModTime = parseDOSTime(header.lastModTimeRaw)
           header.lastModDate = parseDOSDate(header.lastModDateRaw)
         }
-        this.status = header
+        this.status = {header:header, position: position} 
         this.statusId = FILE_HEADER_EXTRA
-        this.nextStep()
+        this.readNext()
       }
       break
     case FILE_HEADER_EXTRA:
-      var header = this.status
+      var header = this.status.header
       var extraDataLength = header.fileNameLength + header.extraFieldLength
       if(!extraDataLength)
         return this.statusId = FILE_DATA
@@ -124,38 +148,39 @@ PkzipParser.prototype.nextStep = function(){
           header.extraFieldData = extraData.slice(header.fileNameLength)
         }
         this.statusId = FILE_DATA
-        this.status.read = 0
+        this.status.position.read = 0
         this.status.stream = new PkzipDataStream()
-        this.emit('file', this.status)
-        this.nextStep()
+        this.emit('file', this.status.header, this.status.position, this.status.stream)
+        this.readNext()
       }
       break
     case FILE_DATA:
-      var currentBuffer = this.cache[this.cacheCursor]
+      var reader = this._reader
+      var currentBuffer = reader.cache[reader.cacheCursor]
       if(currentBuffer){
-        if(!this.status.dataDescriptor){
-          var total = this.status.compressedSize
-          var remaining = total - this.status.read
-          var bufferRemain = currentBuffer.length - this.cursor
+        if(!this.status.header.dataDescriptor){
+          var total = this.status.header.compressedSize
+          var remaining = total - this.status.position.read
+          var bufferRemain = currentBuffer.length - reader.cursor
           if(remaining > bufferRemain){
-            var dataSlice = currentBuffer.slice(this.cursor)
-            this.cacheCursor += 1
-            this.cursor = 0
+            var dataSlice = currentBuffer.slice(reader.cursor)
+            reader.cacheCursor += 1
+            reader.cursor = 0
             this.offset += bufferRemain
-            this.status.read += bufferRemain
+            this.status.position.read += bufferRemain
             this.status.stream.emit('data', dataSlice)
-            this.nextStep()
+            this.readNext()
           } else {
             if(remaining > 0){
-              var dataSlice = currentBuffer.slice(this.cursor, this.cursor + remaining)
+              var dataSlice = currentBuffer.slice(reader.cursor, reader.cursor + remaining)
               this.offset += remaining
-              this.cursor += remaining
-              this.status.read += remaining
+              reader.cursor += remaining
+              this.status.position.read += remaining
               this.status.stream.emit('data', dataSlice)
             }
             this.status.stream.emit('end')
-            this.statusId = this.status.dataDescriptor ? DATA_DESCRIPTOR :  READY
-            this.nextStep()
+            this.statusId = this.status.header.dataDescriptor ? DATA_DESCRIPTOR :  READY
+            this.readNext()
           }
         } else {
           // have to manually seek the Data Descriptor signature. Not fun. Might add later
@@ -195,13 +220,13 @@ PkzipParser.prototype.nextStep = function(){
           header.lastModTime = parseDOSTime(header.lastModTimeRaw)
           header.lastModDate = parseDOSDate(header.lastModDateRaw)
         }
-        this.status = header
+        this.status = {header:header}
         this.statusId = CD_EXTRA
-        this.nextStep()
+        this.readNext()
       }
       break
     case CD_EXTRA:
-      var header = this.status
+      var header = this.status.header
       var extraDataLength = header.fileNameLength + header.extraFieldLength + header.fileCommentLength
       if(!extraDataLength)
         return this.statusId  = READY
@@ -216,7 +241,7 @@ PkzipParser.prototype.nextStep = function(){
         header.fileComment = String.fromCharCode.apply(null, new UInt8Array(fileCommentData))
         this.emit('cd', this.status)
         this.statusId = READY
-        this.nextStep()
+        this.readNext()
       }
       break
     case CD_END:
@@ -233,18 +258,19 @@ PkzipParser.prototype.nextStep = function(){
           , CDOffset: headerData.readUInt32LE(12, true)
           , commentLength: headerData.readUInt16LE(16, true)
         }
-        this.status = header
-        this.statusId = header.commentLength ? CD_END_EXTRA : READY 
-        this.nextStep()
+        this.status = {header:header}
+        this.statusId = READY
+        this.readNext()
       }
       break
     case CD_END_EXTRA:
-      if(!this.commentLength){
-        var commentData = this.read(this.commentLength)
+      var header = this.status.header
+      if(!header.commentLength){
+        var commentData = this.read(header.commentLength)
         if(!commentData)
           return
-        this.offset += this.commentLength
-        this.status.comment = String.fromCharCode.apply(null, new UInt8Array(commentData))
+        this.offset += header.commentLength
+        header.comment = String.fromCharCode.apply(null, new UInt8Array(commentData))
       }
       this.statusId = READY
       this.emit('cdEnd', this.status)
@@ -266,42 +292,6 @@ function parseDOSDate(rawDate){
   var month = (rawDate >> 5) & 0x0f
   var year = 1980 + (rawDate >> 9)
   return year + '-' + month + '-' + day
-}
-
-// TODO: good thing to separate into a module 
-PkzipParser.prototype.read = function(count, endOk){
-  var oldCursor = this.cursor
-  var currentBuffer = this.cache[this.cacheCursor]
-  if(currentBuffer){
-    var readEnd = this.cursor + count
-    if(readEnd <= currentBuffer.length){
-      this.cursor += count
-      var data = currentBuffer.slice(oldCursor, this.cursor)
-      return data
-    } else if(this.cache[this.cacheCursor + 1]) {
-      var oldCacheCursor = this.cacheCursor
-      var oldBuffer = currentBuffer.slice(this.cursor)
-
-      this.cursor = 0
-      this.cacheCursor += 1
-
-      //let's hope this recurses safely
-      var nextBuffer = this.read(count - oldBuffer.length, endOk)
-      if(nextBuffer){
-        var data = combineBuffers(oldBuffer, nextBuffer)
-        return data
-      } else {
-        this.cursor = oldCursor
-        this.cacheCursor = oldCacheCursor
-      }
-    }
-  }
-  if(this.ended && !endOk)
-    this.emit('error', "read could not be performed on ended stream")
-}
-
-function combineBuffers(buf1, buf2){
-  return Buffer.concat([buf1, buf2], buf1.length + buf2.length)
 }
 
 function PkzipDataStream(){
