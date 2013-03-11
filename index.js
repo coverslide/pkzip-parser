@@ -247,10 +247,10 @@ PkzipParser.prototype.readNext = function(){
         if(extraData){
           this.offset += extraDataLength
           var fileNameData = extraData.slice(0, header.fileNameLength)
-          header.fileName = String.fromCharCode.apply(null, new UInt8Array(fileNameData))
+          header.fileName = fileNameData.toString()
           header.extraFieldData = extraData.slice(header.fileNameLength, header.fileNameLength + header.extraFieldLength)
           var fileCommentData = extraData.slice(header.fileNameLength + header.extraFieldLength)
-          header.fileComment = String.fromCharCode.apply(null, new UInt8Array(fileCommentData))
+          header.fileComment = fileCommentData.toString()
           this.emit('cd', this.status)
           this.statusId = READY
           continue loop
@@ -288,10 +288,10 @@ PkzipParser.prototype.readNext = function(){
           if(!commentData)
             break loop
           this.offset += header.commentLength
-          header.comment = String.fromCharCode.apply(null, new UInt8Array(commentData))
+          header.comment = commentData.toString()
         }
         this.statusId = READY
-        this.emit('cdEnd', this.status)
+        this.emit('cd-end', this.status)
         this.emit('end')
         break
     }

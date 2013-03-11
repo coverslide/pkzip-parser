@@ -1,7 +1,7 @@
 var pkzip = require('./')
 var fs = require('fs')
 
-var st = fs.createReadStream('./example.zip', {bufferSize: 13  })
+var st = fs.createReadStream('./example.zip', {bufferSize: 32*1024  })
 
 var unzip = new pkzip()
 
