@@ -1,6 +1,6 @@
 'use strict'
 
-require('mkreader')(PkzipParser)
+require('inherits')(PkzipParser, require('simple-reader'))
 require('mkstream')(PkzipDataStream)
 
 var Buffer = require('buffer').Buffer
